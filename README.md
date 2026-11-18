@@ -25,10 +25,10 @@ Arduino Library for receiving SBUS and SBUS2 Frames and transmit Telemetry Data
 - with Atmega328P MCU
   - The Library uses the U(S)ART Interrupt and Timer2
   - **You can't use Serial in your Sketch! Please use Softserial instead.**
-- with ESP32
-  - The Library uses Serial1 (UART_NUM_1) and TIMER_1 in TIMER_GROUP_0
-  - RX1 = GPIO_NUM_25 and TX1 = GPIO_NUM_26
-  - Serial, Timer and RX/TX Pins can be changed
+-- with ESP32 (ESP32, S3, C3, C6)
+  * The Library uses UART1 and a hardware timer (TIMER_1 on ESP32/S3, TIMER_0 on C3/C6)
+  * Default RX/TX pins depend on the chip; see the pin defaults in `src/SBUS_usart_ESP32.cpp`
+  * Pins can be changed in `SBUS2_Setup(rxPin, txPin)`
 
 
 ## Setting up the Example Sketch
