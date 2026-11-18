@@ -1,3 +1,24 @@
+# SBUS2-Telemetry-ESP32
+
+Fork of [BrushlessPower/SBUS2-Telemetry](https://github.com/BrushlessPower/SBUS2-Telemetry) by BrushlessPower, updated for current ESP32 chips and the ESP32 Arduino core 3.x (ESP-IDF 5).
+
+### What's different from the original
+- Rewritten ESP32 UART driver for Arduino core 3.x / ESP-IDF 5
+- Receive fix: SBUS input no longer jams when several telemetry sensors share the bus
+- GPS fix: South and West coordinates display correctly
+- ESP32-C3 and C6 support
+
+### Installation
+Arduino IDE: **Tools → Manage Libraries**, search for **SBUS2-Telemetry-ESP32**, then install.
+Updates appear in the Library Manager automatically.
+
+> Don't install this alongside the original "SBUS2" library, as both provide `SBUS2.h`.
+
+### Usage
+The API is the same as the original: `#include <SBUS2.h>`. Existing sketches work without changes.
+
+---
+*The original documentation follows below.*
 # SBUS2-Telemetry Library
 Arduino Library for receiving SBUS and SBUS2 Frames and transmit Telemetry Data 
 
