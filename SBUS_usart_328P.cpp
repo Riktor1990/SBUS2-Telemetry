@@ -13,6 +13,10 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+// Modified by Riktor1990, 2026: IDF5 UART driver, receive-path fix,
+// GPS hemisphere fix, ESP32-C3/C6 timer support.
+// Original: https://github.com/BrushlessPower/SBUS2-Telemetry (GPL-3.0)
+
 #include "SBUS_usart.h"
 #include <Arduino.h>
 #if defined (__AVR_ATmega328P__)

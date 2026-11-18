@@ -222,7 +222,7 @@ void send_f1675_gps(uint8_t port, uint16_t speed, int16_t altitude, int16_t vari
     bytes[2] = ((value3 >> 16) & 0x0f);    // North
    }
    else{
-    bytes[2] = ((value3 >> 16) | 0x1f);    // South
+    bytes[2] = ((value3 >> 16) & 0x0f) | 0x10;    // South: bit4 = hemisphere flag, bits0-3 = minutes (patched, was | 0x1f)
    }
    SBUS2_transmit_telemetry_data( port+4 , bytes);
 
@@ -244,7 +244,7 @@ void send_f1675_gps(uint8_t port, uint16_t speed, int16_t altitude, int16_t vari
     bytes[2] = ((value3 >> 16) & 0x0f);    // Eath
    }
    else{
-    bytes[2] = ((value3 >> 16) | 0x1f);    // West
+    bytes[2] = ((value3 >> 16) & 0x0f) | 0x10;    // West: bit4 = hemisphere flag, bits0-3 = minutes (patched, was | 0x1f)
    }
    SBUS2_transmit_telemetry_data( port+6 , bytes);
 

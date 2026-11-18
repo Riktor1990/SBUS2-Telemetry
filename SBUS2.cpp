@@ -13,6 +13,10 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+// Modified by Riktor1990, 2026: IDF5 UART driver, receive-path fix,
+// GPS hemisphere fix, ESP32-C3/C6 timer support.
+// Original: https://github.com/BrushlessPower/SBUS2-Telemetry (GPL-3.0)
+
 #include "SBUS2.h"
 #include "SBUS_usart.h"
 
@@ -222,7 +226,7 @@ void send_f1675_gps(uint8_t port, uint16_t speed, int16_t altitude, int16_t vari
     bytes[2] = ((value3 >> 16) & 0x0f);    // North
    }
    else{
-    bytes[2] = ((value3 >> 16) | 0x1f);    // South
+    bytes[2] = ((value3 >> 16) & 0x0f) | 0x10;    // South: bit4 = hemisphere flag, bits0-3 = minutes (patched, was | 0x1f)
    }
    SBUS2_transmit_telemetry_data( port+4 , bytes);
 
@@ -244,7 +248,7 @@ void send_f1675_gps(uint8_t port, uint16_t speed, int16_t altitude, int16_t vari
     bytes[2] = ((value3 >> 16) & 0x0f);    // Eath
    }
    else{
-    bytes[2] = ((value3 >> 16) | 0x1f);    // West
+    bytes[2] = ((value3 >> 16) & 0x0f) | 0x10;    // West: bit4 = hemisphere flag, bits0-3 = minutes (patched, was | 0x1f)
    }
    SBUS2_transmit_telemetry_data( port+6 , bytes);
 

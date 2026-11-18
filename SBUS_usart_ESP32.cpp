@@ -12,6 +12,10 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
 
+// Modified by Riktor1990, 2026: IDF5 UART driver, receive-path fix,
+// GPS hemisphere fix, ESP32-C3/C6 timer support.
+// Original: https://github.com/BrushlessPower/SBUS2-Telemetry (GPL-3.0)
+
 #if defined(ESP32)
 
 #include "SBUS_usart.h"
@@ -25,6 +29,16 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #include "driver/gpio.h"
 #include "soc/uart_struct.h"   // direct UARTx register access
 #include "esp_idf_version.h"
+#include "soc/soc_caps.h"
+
+// Timer used for the telemetry slot sequence. ESP32/S2/S3 have two
+// general-purpose timers per group (TIMER_1 was always used); C3/C6/H2 have
+// only one per group, where TIMER_1 does not exist.
+#if SOC_TIMER_GROUP_TIMERS_PER_GROUP > 1
+  #define SBUS2_TIMER  TIMER_1
+#else
+  #define SBUS2_TIMER  TIMER_0
+#endif
 
 #if ESP_IDF_VERSION_MAJOR >= 5
   // Use the UART driver’s event queue on IDF5+ (uart_isr_register() was removed)
@@ -47,6 +61,11 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #elif CONFIG_IDF_TARGET_ESP32S2
   #define SBUS2_UART_RX_PIN   (2)
   #define SBUS2_UART_TX_PIN   (7)
+#elif CONFIG_IDF_TARGET_ESP32C6
+  // Waveshare ESP32-C6-Zero: avoid 4/5/8/9/15 (strapping), 12/13 (USB),
+  // 16/17 (UART0), 6-13 (bottom pads only)
+  #define SBUS2_UART_RX_PIN   (18)
+  #define SBUS2_UART_TX_PIN   (19)
 #elif CONFIG_IDF_TARGET_ESP32S3
   // Choose safe pins (you can override when calling SBUS2_uart_setup)
   #define SBUS2_UART_RX_PIN   (12)
@@ -211,24 +230,24 @@ void SBUS2_uart_setup(int rx, int tx, int uart)
 
   // === Portable RX thresholds / timeout (replaces uart_intr_config + macros) ===
   // trigger interrupt when ~full SBUS frame is in FIFO and set RX timeout (~2 chars)
-  uart_set_rx_full_threshold(uart_num, 26);  // SBUS frame is 25 bytes
+  uart_set_rx_full_threshold(uart_num, 25);  // SBUS frame is 25 bytes
   uart_set_rx_timeout(uart_num, 2);
 
   // Timer for telemetry TX sequence
-  timer_init(TIMER_GROUP_0, TIMER_1, &timer_config);
-  timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0);
-  timer_set_alarm_value(TIMER_GROUP_0,   TIMER_1, SLOT_TIME);
-  timer_enable_intr(TIMER_GROUP_0,       TIMER_1);
+  timer_init(TIMER_GROUP_0, SBUS2_TIMER, &timer_config);
+  timer_set_counter_value(TIMER_GROUP_0, SBUS2_TIMER, 0);
+  timer_set_alarm_value(TIMER_GROUP_0,   SBUS2_TIMER, SLOT_TIME);
+  timer_enable_intr(TIMER_GROUP_0,       SBUS2_TIMER);
 
 #if ESP_IDF_VERSION_MAJOR >= 5
   // IDF5+: use callback API
-  ESP_ERROR_CHECK(timer_isr_callback_add(TIMER_GROUP_0, TIMER_1, &timer_cb_wrapper, NULL, 0));
+  ESP_ERROR_CHECK(timer_isr_callback_add(TIMER_GROUP_0, SBUS2_TIMER, &timer_cb_wrapper, NULL, 0));
 #else
   // IDF4.x: legacy ISR register
-  timer_isr_register(TIMER_GROUP_0, TIMER_1, &ISR_transmit_frame, NULL, 0, NULL);
+  timer_isr_register(TIMER_GROUP_0, SBUS2_TIMER, &ISR_transmit_frame, NULL, 0, NULL);
 #endif
 
-  timer_set_alarm(TIMER_GROUP_0, TIMER_1, TIMER_ALARM_EN);
+  timer_set_alarm(TIMER_GROUP_0, SBUS2_TIMER, TIMER_ALARM_EN);
 
   // Make sure RX ring is clean
 #if ESP_IDF_VERSION_MAJOR >= 5
@@ -236,14 +255,15 @@ void SBUS2_uart_setup(int rx, int tx, int uart)
 #else
   uart_flush(uart_num);
 #endif
-
+uart_flush_input(uart_num);
+buffer_index = 0;
   initialize_slot_status();
   enable_receiving();
 
 #if ESP_IDF_VERSION_MAJOR >= 5
   // Spawn a tiny task to process UART events and read bytes from the driver RX ring
   if (s_uart_task == nullptr) {
-    xTaskCreatePinnedToCore(uart_event_task, "sbus2_uart_evt", 2048, NULL, 20, &s_uart_task, ARDUINO_RUNNING_CORE);
+    xTaskCreatePinnedToCore(uart_event_task, "sbus2_uart_evt", 8192, NULL, 20, &s_uart_task, ARDUINO_RUNNING_CORE);
   }
 #endif
 
@@ -268,19 +288,19 @@ static void disable_receiving() {
   sequence_count = 0;
 
   // Start 2ms timer to schedule slot #1 after a valid SBUS2 frame
-  timer_set_alarm(TIMER_GROUP_0, TIMER_1, TIMER_ALARM_DIS);
-  timer_pause(TIMER_GROUP_0,  TIMER_1);
-  timer_set_alarm_value(TIMER_GROUP_0, TIMER_1, WAIT_TIME);
-  timer_set_counter_value(TIMER_GROUP_0,   TIMER_1, 0);
-  timer_set_alarm(TIMER_GROUP_0, TIMER_1, TIMER_ALARM_EN);
-  timer_start(TIMER_GROUP_0, TIMER_1);
+  timer_set_alarm(TIMER_GROUP_0, SBUS2_TIMER, TIMER_ALARM_DIS);
+  timer_pause(TIMER_GROUP_0,  SBUS2_TIMER);
+  timer_set_alarm_value(TIMER_GROUP_0, SBUS2_TIMER, WAIT_TIME);
+  timer_set_counter_value(TIMER_GROUP_0,   SBUS2_TIMER, 0);
+  timer_set_alarm(TIMER_GROUP_0, SBUS2_TIMER, TIMER_ALARM_EN);
+  timer_start(TIMER_GROUP_0, SBUS2_TIMER);
 }
 
 static void enable_receiving() {
   // 15ms guard (approx, long enough to catch next frame timeout)
-  timer_set_counter_value(TIMER_GROUP_0,   TIMER_1, 0);
-  timer_set_alarm_value(TIMER_GROUP_0,     TIMER_1, 15000);
-  timer_set_alarm(TIMER_GROUP_0,           TIMER_1, TIMER_ALARM_EN);
+  timer_set_counter_value(TIMER_GROUP_0,   SBUS2_TIMER, 0);
+  timer_set_alarm_value(TIMER_GROUP_0,     SBUS2_TIMER, 15000);
+  timer_set_alarm(TIMER_GROUP_0,           SBUS2_TIMER, TIMER_ALARM_EN);
 
   // Reset buffer for new RX
   buffer_index = 0;
@@ -299,53 +319,64 @@ static inline void IncreaseTimer(int8_t frameNumber) {
 // ------------------------ UART RX processing ------------------------
 
 #if ESP_IDF_VERSION_MAJOR >= 5
-// IDF5+: process UART driver events and read bytes from the RX ring
+// IDF5+: process UART driver events and read bytes from the RX ring.
+//
+// Each burst on the SBUS2 wire (one 25-byte servo frame, or one 3-byte
+// telemetry slot from any sensor) is followed by a gap longer than the RX
+// timeout, so the driver posts exactly one UART_DATA event per burst, with
+// event.size = burst length. We read exactly event.size bytes per event, so
+// burst boundaries are kept even if this task runs late and several bursts
+// are already waiting in the ring (high telemetry traffic, e.g. a GPS sensor
+// filling many slots). Each burst is classified on its own and then dropped:
+// nothing accumulates between bursts, so the parser cannot get stuck.
+// An idle timeout and overflow handling are kept as extra recovery paths.
+#define RX_IDLE_RESET_MS  20
+
 static void uart_event_task(void *pvParameters)
 {
   (void)pvParameters;
   uart_event_t event;
 
   for (;;) {
-    if (xQueueReceive(s_uart_queue, &event, portMAX_DELAY) != pdTRUE) continue;
+    if (xQueueReceive(s_uart_queue, &event, pdMS_TO_TICKS(RX_IDLE_RESET_MS)) != pdTRUE) {
+      buffer_index = 0;          // line idle: nothing pending
+      continue;
+    }
 
     if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL) {
-      // reset RX ring if overflow
+      // Ring and event queue are out of step: clear both and start fresh.
       uart_flush_input(uart_num);
+      xQueueReset(s_uart_queue);
+      buffer_index = 0;
+      log_d("[SBUS2] RX overflow, flushed");
       continue;
     }
 
-    if (event.type != UART_DATA && event.type != UART_PATTERN_DET && event.type != UART_DATA_BREAK && event.type != UART_PARITY_ERR && event.type != UART_FRAME_ERR) {
-      continue;
+    if (event.type != UART_DATA) {
+      continue;                  // parity/frame errors etc.: data still arrives as UART_DATA
     }
 
-    size_t avail = 0;
-    uart_get_buffered_data_len(uart_num, &avail);
-
- while (avail--) {
-  uint8_t b;
-  int r = uart_read_bytes(uart_num, &b, 1, 0);
-  if (r == 1) {
-    if (buffer_index < UART_RXBUFSIZE) {
-      rxbuf[buffer_index] = b;
-      buffer_index++;
+    // Read exactly this burst. Bytes beyond the buffer are drained but not stored.
+    size_t len = 0;
+    for (size_t remaining = event.size; remaining > 0; remaining--) {
+      uint8_t b;
+      if (uart_read_bytes(uart_num, &b, 1, 0) != 1) break;
+      if (len < UART_RXBUFSIZE) rxbuf[len] = b;
+      len++;
     }
-  }
-}
+    buffer_index = 0;            // not used for parsing on IDF5; kept for compatibility
 
-
-    // Mirror the original ISR logic to classify the received chunk
-    if ((buffer_index == SBUS_FRAME_SIZE) && (rxbuf[0] == 0x0F)) {
+    if ((len == SBUS_FRAME_SIZE) && (rxbuf[0] == 0x0F)) {
       telemetry_ready = false;
       sbus_ready      = false;
       frame_ready     = true;
 
-      for (uint8_t i = 0; i < UART_RXBUFSIZE; i++) {
+      for (uint8_t i = 0; i < SBUS_FRAME_SIZE; i++) {
         sbusData[i] = rxbuf[i];
       }
 
       disable_receiving();
       IncreaseTimer((rxbuf[24] & 0x30) >> 4);
-      buffer_index = 0;
 
       if ((rxbuf[24] & 0x0F) == 0x04) {
         telemetry_ready = true;
@@ -357,26 +388,20 @@ static void uart_event_task(void *pvParameters)
         sbus_ready      = true;
         SBUS2_get_all_servo_data();
       } else {
-        uart_flush_input(uart_num);
-        log_i("[SBUS2] Invalid Frame End Byte");
+        log_d("[SBUS2] Invalid Frame End Byte");
       }
     }
-    else if (buffer_index == SBUS_FRAME_SIZE) {
-      uart_flush_input(uart_num);
-      log_i("[SBUS2] Invalid Frame Start Byte");
-      buffer_index = 0;
-    }
-    else if ((buffer_index == SLOT_DATA_LENGTH) && (((rxbuf[0] & 0x0F) == 0x03) || ((rxbuf[0] & 0x0F) == 0x0B))) {
+    else if ((len == SLOT_DATA_LENGTH) && (((rxbuf[0] & 0x0F) == 0x03) || ((rxbuf[0] & 0x0F) == 0x0B))) {
       uint8_t temp = rxbuf[0];
       telemetryData[temp]     = rxbuf[0];
       telemetryData[temp + 1] = rxbuf[1];
       telemetryData[temp + 2] = rxbuf[2];
-      buffer_index = 0;
     }
-    else if (buffer_index == SLOT_DATA_LENGTH) {
-      uart_flush_input(uart_num);
-      log_i("[SBUS2] Invalid Slot ID");
-      buffer_index = 0;
+    else {
+      // Unknown length or content (partial frame at power-up, two slots merged
+      // because a sensor transmitted late, corrupted byte...). Drop this burst
+      // only; the next one is parsed normally. Worst case: one frame lost.
+      log_d("[SBUS2] Discarded burst of %u bytes", (unsigned)len);
     }
   }
 }
@@ -468,8 +493,8 @@ static void ISR_transmit_frame(void *arg)
   (void)arg;
 
 #if ESP_IDF_VERSION_MAJOR >= 5
-  timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, TIMER_1);
-  timer_group_enable_alarm_in_isr(TIMER_GROUP_0, TIMER_1);
+  timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, SBUS2_TIMER);
+  timer_group_enable_alarm_in_isr(TIMER_GROUP_0, SBUS2_TIMER);
 #else
   TIMERG0.int_clr_timers.t1 = 1;
   TIMERG0.hw_timer[1].config.alarm_en = 1;
@@ -494,13 +519,13 @@ static void ISR_transmit_frame(void *arg)
     }
 
     // last slot has slightly longer pause
-    timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0);
+    timer_set_counter_value(TIMER_GROUP_0, SBUS2_TIMER, 0);
     if (sequence_count == 7) {
-      timer_set_alarm_value(TIMER_GROUP_0, TIMER_1, 5150);
+      timer_set_alarm_value(TIMER_GROUP_0, SBUS2_TIMER, 5150);
     } else {
-      timer_set_alarm_value(TIMER_GROUP_0, TIMER_1, SLOT_TIME);
+      timer_set_alarm_value(TIMER_GROUP_0, SBUS2_TIMER, SLOT_TIME);
     }
-    timer_set_alarm(TIMER_GROUP_0, TIMER_1, TIMER_ALARM_EN);
+    timer_set_alarm(TIMER_GROUP_0, SBUS2_TIMER, TIMER_ALARM_EN);
   } else {
     if (DemoMode) {
       pinMatrixOutAttach(tx_pin, U1TXD_OUT_IDX, false, false);
@@ -650,7 +675,7 @@ bool SBUS2_get_Slot(uint8_t slot, uint8_t *lowbyte, uint8_t *highbyte)
 void SBUS_disable()
 {
   uart_disable_rx_intr(uart_num);
-  timer_set_alarm(TIMER_GROUP_0, TIMER_1, TIMER_ALARM_DIS);
+  timer_set_alarm(TIMER_GROUP_0, SBUS2_TIMER, TIMER_ALARM_DIS);
 }
 
 void SBUS_enable()

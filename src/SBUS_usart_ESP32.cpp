@@ -1,675 +1,687 @@
 /*
+
 This program is free software: you can redistribute it and/or modify
 it under the terms of the GNU General Public License as published by
 the Free Software Foundation, either version 3 of the License, or
 (at your option) any later version.
-
 This program is distributed in the hope that it will be useful,
 but WITHOUT ANY WARRANTY; without even the implied warranty of
 MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 GNU General Public License for more details.
-
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
-#if defined (ESP32)
+
+#if defined(ESP32)
+
 #include "SBUS_usart.h"
 #include "esp32-hal.h"
 #include "esp32-hal-uart.h"
 
-//#include "freertos/FreeRTOS.h"
-//#include "freertos/event_groups.h"
-//#include "esp_task.h"
-//#include "esp_task_wdt.h"
-//#include "freertos/queue.h"
-#include "driver/uart.h"
-#include <soc/uart_reg.h>
-#include <driver/timer.h>
-#include <soc/uart_struct.h>
-#include <soc/timer_group_struct.h>
-
-#include <stdarg.h>
-#include <stdlib.h>
 #include <string.h>
 
-#define SLOT_DATA_LENGTH 3
-#define NUMBER_OF_FRAMES 4
-#define NUMBER_OF_SLOT 32
-#define NUMBER_OF_SLOT_IN_FRAME 8
-#define SBUS_FRAME_SIZE 25
+#include "driver/uart.h"
+#include "driver/timer.h"
+#include "driver/gpio.h"
+#include "soc/uart_struct.h"   // direct UARTx register access
+#include "esp_idf_version.h"
+#include "soc/soc_caps.h"
 
-#define SBUS2_UART_RX_PIN (GPIO_NUM_25)
-#define SBUS2_UART_TX_PIN (GPIO_NUM_26)
+// Timer used for the telemetry slot sequence. ESP32/S2/S3 have two
+// general-purpose timers per group (TIMER_1 was always used); C3/C6/H2 have
+// only one per group, where TIMER_1 does not exist.
+#if SOC_TIMER_GROUP_TIMERS_PER_GROUP > 1
+  #define SBUS2_TIMER  TIMER_1
+#else
+  #define SBUS2_TIMER  TIMER_0
+#endif
 
-#define UART_RXBUFSIZE 30
+#if ESP_IDF_VERSION_MAJOR >= 5
+  // Use the UART driver’s event queue on IDF5+ (uart_isr_register() was removed)
+  #include "freertos/FreeRTOS.h"
+  #include "freertos/queue.h"
+  #include "freertos/task.h"
+#endif
 
-#define SLOT_TIME 660 // 660 ms
-#define WAIT_TIME 2000 // 2000 ms
+// ------------------------ configuration ------------------------
 
-#define RX_BUF_SIZE 1024 // we dont need more space in buffer
+#define SLOT_DATA_LENGTH            3
+#define NUMBER_OF_FRAMES            4
+#define NUMBER_OF_SLOT              32
+#define NUMBER_OF_SLOT_IN_FRAME     8
+#define SBUS_FRAME_SIZE             25
+
+#if CONFIG_IDF_TARGET_ESP32
+  #define SBUS2_UART_RX_PIN   (GPIO_NUM_25)
+  #define SBUS2_UART_TX_PIN   (GPIO_NUM_26)
+#elif CONFIG_IDF_TARGET_ESP32S2
+  #define SBUS2_UART_RX_PIN   (2)
+  #define SBUS2_UART_TX_PIN   (7)
+#elif CONFIG_IDF_TARGET_ESP32C6
+  // Waveshare ESP32-C6-Zero: avoid 4/5/8/9/15 (strapping), 12/13 (USB),
+  // 16/17 (UART0), 6-13 (bottom pads only)
+  #define SBUS2_UART_RX_PIN   (18)
+  #define SBUS2_UART_TX_PIN   (19)
+#elif CONFIG_IDF_TARGET_ESP32S3
+  // Choose safe pins (you can override when calling SBUS2_uart_setup)
+  #define SBUS2_UART_RX_PIN   (12)
+  #define SBUS2_UART_TX_PIN   (13)
+#else
+  #define SBUS2_UART_RX_PIN   (GPIO_NUM_6)
+  #define SBUS2_UART_TX_PIN   (GPIO_NUM_5)
+#endif
+
+#define UART_RXBUFSIZE              30
+#define SLOT_TIME                   660   // µs
+#define WAIT_TIME                   2000  // µs
+#define RX_BUF_SIZE                 1024  // UART driver RX ring size
+
+// IDF version–portable inversion flags
+#if ESP_IDF_VERSION_MAJOR >= 5
+  #define UART_INV_RX  UART_SIGNAL_RXD_INV
+  #define UART_INV_TX  UART_SIGNAL_TXD_INV
+#else
+  #define UART_INV_RX  UART_INVERSE_RXD
+  #define UART_INV_TX  UART_INVERSE_TXD
+#endif
+
+// ------------------------ globals ------------------------
 
 bool DemoMode = false;
 
-// 32 Slots for telemetrie Data
-uint8_t Slot_ID[NUMBER_OF_SLOT] = {0x03, 0x83, 0x43, 0xC3, 0x23, 0xA3, 0x63, 0xE3,
-                                   0x13, 0x93, 0x53, 0xD3, 0x33, 0xB3, 0x73, 0xF3,
-                                   0x0B, 0x8B, 0x4B, 0xCB, 0x2B, 0xAB, 0x6B, 0xEB,
-                                   0x1B, 0x9B, 0x5B, 0xDB, 0x3B, 0xBB, 0x7B, 0xFB};
+// 32 slot IDs for telemetry
+static const uint8_t Slot_ID[NUMBER_OF_SLOT] = {
+  0x03, 0x83, 0x43, 0xC3, 0x23, 0xA3, 0x63, 0xE3,
+  0x13, 0x93, 0x53, 0xD3, 0x33, 0xB3, 0x73, 0xF3,
+  0x0B, 0x8B, 0x4B, 0xCB, 0x2B, 0xAB, 0x6B, 0xEB,
+  0x1B, 0x9B, 0x5B, 0xDB, 0x3B, 0xBB, 0x7B, 0xFB
+};
 
-char sbus_frame[25] = {0x0F, 0xA0, 0xA3, 0x20, 0x56, 0x2C, 0x08, 0x16, 0x50, 0x03, 0x10, 0x80, 0x00, 0x04, 0x20, 0x00, 0x01, 0x08, 0x07, 0xC8, 0x03, 0x10, 0x80, 0x02, 0x04};
+static char sbus_frame[SBUS_FRAME_SIZE] = {
+  0x0F, 0xA0, 0xA3, 0x20, 0x56, 0x2C, 0x08, 0x16, 0x50, 0x03,
+  0x10, 0x80, 0x00, 0x04, 0x20, 0x00, 0x01, 0x08, 0x07, 0xC8,
+  0x03, 0x10, 0x80, 0x02, 0x04
+};
 
-// channels for connected servos at the SBUS
-uint16_t channels[NUMBER_OF_CHANNELS];
+// channels for connected servos at the SBUS (declared in SBUS_usart.h)
+static uint16_t channels[NUMBER_OF_CHANNELS];
 
-static volatile uint8_t rxbuf[UART_RXBUFSIZE];
-static volatile uint8_t sbusData[UART_RXBUFSIZE];
-static volatile uint8_t telemetryData[256];
-static volatile bool frame_ready = false;
-static volatile bool telemetry_ready = false;
-static volatile bool sbus_ready = false;
-static volatile uint8_t gl_current_frame = 0;
-static volatile uint16_t uart_lost_frame = 0;
-static volatile uint8_t   FER_count = 0;
-static volatile uint8_t   FER_buf[100];
+static volatile uint8_t  rxbuf[UART_RXBUFSIZE];
+static volatile uint8_t  sbusData[UART_RXBUFSIZE];
+static volatile uint8_t  telemetryData[256];
 
-static volatile uint8_t        buffer_index = 0;
+static volatile bool     frame_ready      = false;
+static volatile bool     telemetry_ready  = false;
+static volatile bool     sbus_ready       = false;
+static volatile uint8_t  gl_current_frame = 0;
+static volatile uint16_t uart_lost_frame  = 0;
+static volatile uint8_t  FER_count        = 0;
+static volatile uint8_t  FER_buf[100];
+static volatile uint8_t  buffer_index     = 0;
 
-static volatile uint8_t tx_pin;
-uart_port_t uart_num;
+static volatile uint8_t  tx_pin;
+static uart_port_t       uart_num;
 
-typedef enum
-{
-   EMPTY = 0,
-   TRANSMITTING,
-   AVAILABLE
+typedef enum {
+  EMPTY = 0,
+  TRANSMITTING,
+  AVAILABLE
 } SLOT_DATA_STATUS;
 
-typedef struct
-{
-   bool data_status;
-   uint8_t data[SLOT_DATA_LENGTH];
-} SLOT_RAW_DATA;
+static volatile int8_t   previousFrame   = 0;
+static volatile uint32_t frameCounter    = 0;
+static volatile uint8_t  sequence_count  = 0;   // transmit step
+static volatile bool     transmit        = false;
 
-static volatile int8_t          previousFrame = 0;
-static volatile uint32_t        frameCounter = 0;
+static volatile SLOT_DATA_STATUS transmit_data_per_slot_status[NUMBER_OF_SLOT];
+static volatile uint8_t         transmit_data_per_slot_data[NUMBER_OF_SLOT][SLOT_DATA_LENGTH];
 
-static volatile uint8_t sequence_count = 0; // first sequence step delay will be filled in when the transmit sequence is enabled
+#if ESP_IDF_VERSION_MAJOR >= 5
+static QueueHandle_t s_uart_queue = nullptr;
+static TaskHandle_t  s_uart_task  = nullptr;
+#endif
 
-static volatile bool transmit = false;
+// ------------------------ forward decls ------------------------
 
+static void initialize_slot_status();
+static void enable_receiving();
+static void disable_receiving();
+static void start_transmit_sequencer(uint8_t frame_number);
+static void SBUS2_get_all_servo_data();
 
-volatile SLOT_DATA_STATUS transmit_data_per_slot_status[NUMBER_OF_SLOT];
-volatile uint8_t transmit_data_per_slot_data[NUMBER_OF_SLOT][SLOT_DATA_LENGTH];
-
-void initialize_slot_status();
-void enable_receiving();
-void disable_receiving();
-void start_transmit_sequencer(uint8_t frame_number);
-
-void SBUS2_get_all_servo_data();
-
-
-/*******************************************************************************
- * ESP32 is able to invert the RX and TX Lines itself, so we dont need an external inverter
- * Also the HardwareSerial Library has interup driven input/output buffers and we dont need 
- * to implent this on our own. 
- * I implement the receiver part as an extra task, to avoid looping in main loop.
- * The transmitter is also implemented as a task to be able to follow the requird timings.
- * 
- */
- 
-uart_config_t uart_config = {
-    .baud_rate = 100000,
-    .data_bits = UART_DATA_8_BITS,
-    .parity = UART_PARITY_EVEN,
-    .stop_bits = UART_STOP_BITS_2,
-    .flow_ctrl = UART_HW_FLOWCTRL_DISABLE};
-
-timer_config_t timer_config = {
-      .alarm_en = TIMER_ALARM_EN,        //Alarm Enable
-      .counter_en = TIMER_PAUSE,      //If the counter is enabled it will start incrementing / decrementing immediately after calling timer_init()
-      .intr_type = TIMER_INTR_LEVEL,  //Is interrupt is triggered on timer’s alarm (timer_intr_mode_t)
-      .counter_dir = TIMER_COUNT_UP,  //Does counter increment or decrement (timer_count_dir_t)
-      .auto_reload = TIMER_AUTORELOAD_EN,      //If counter should auto_reload a specific initial value on the timer’s alarm, or continue incrementing or decrementing.
-      .divider = 80           //Divisor of the incoming 80 MHz (12.5nS) APB_CLK clock. E.g. 80 = 1uS per timer tick
-    };
-
-
-
-/* ISR to transmit the frame */
 static void IRAM_ATTR ISR_transmit_frame(void *arg);
-static void IRAM_ATTR uart_intr_handle(void *arg);
+static void IRAM_ATTR uart_intr_handle(void *arg);  // used on IDF4.x
 
-//*****************************************************************************
-//
-void SBUS2_enable_simulation(){
-	log_i("[SBUS2] Demo Mode enabled");
-	DemoMode = true;
-}
+#if ESP_IDF_VERSION_MAJOR >= 5
+static void uart_event_task(void *pvParameters);
+static bool IRAM_ATTR timer_cb_wrapper(void *arg) { ISR_transmit_frame(arg); return false; }
+#endif
 
-void SBUS2_disable_simulation(){
-	log_i("[SBUS2] Demo Mode disabled");
-	DemoMode = false;
-}
+// ------------------------ peripheral configs ------------------------
 
-void SBUS2_uart_setup()
-{
-   SBUS2_uart_setup(SBUS2_UART_RX_PIN, SBUS2_UART_TX_PIN, UART_NUM_1 );
-}
+static uart_config_t uart_config = {
+  .baud_rate  = 100000,
+  .data_bits  = UART_DATA_8_BITS,
+  .parity     = UART_PARITY_EVEN,
+  .stop_bits  = UART_STOP_BITS_2,
+  .flow_ctrl  = UART_HW_FLOWCTRL_DISABLE,
+#if ESP_IDF_VERSION_MAJOR >= 5
+  .source_clk = UART_SCLK_DEFAULT
+#endif
+};
 
-void SBUS2_uart_setup(int rx, int tx)
-{
-   SBUS2_uart_setup(rx, tx, UART_NUM_1 );
-}
+static timer_config_t timer_config = {
+  .alarm_en     = TIMER_ALARM_EN,
+  .counter_en   = TIMER_PAUSE,
+  .intr_type    = TIMER_INTR_LEVEL,
+  .counter_dir  = TIMER_COUNT_UP,
+  .auto_reload  = TIMER_AUTORELOAD_EN,
+  .divider      = 80       // 80 MHz APB -> 1 µs ticks
+};
+
+// ------------------------ public API ------------------------
+
+void SBUS2_enable_simulation()  { log_i("[SBUS2] Demo Mode enabled");  DemoMode = true; }
+void SBUS2_disable_simulation() { log_i("[SBUS2] Demo Mode disabled"); DemoMode = false; }
+
+void SBUS2_uart_setup()                  { SBUS2_uart_setup(SBUS2_UART_RX_PIN, SBUS2_UART_TX_PIN, UART_NUM_1); }
+void SBUS2_uart_setup(int rx, int tx)    { SBUS2_uart_setup(rx,               tx,               UART_NUM_1);  }
 
 void SBUS2_uart_setup(int rx, int tx, int uart)
 {
-   tx_pin = tx;
-   uart_num = (uart_port_t)uart;
-   ESP_ERROR_CHECK(uart_param_config(uart_num, &uart_config));
-#if(ESP_ARDUINO_VERSION_MAJOR == 2)
-   ESP_ERROR_CHECK(uart_set_line_inverse(uart_num, UART_SIGNAL_TXD_INV | UART_SIGNAL_RXD_INV));         // V2.0.0
+  tx_pin  = (uint8_t)tx;
+  uart_num = (uart_port_t)uart;
+
+  // Basic UART config
+  ESP_ERROR_CHECK(uart_param_config(uart_num, &uart_config));
+
+  // Invert RX/TX for SBUS
+#if ESP_IDF_VERSION_MAJOR >= 5
+  ESP_ERROR_CHECK(uart_set_line_inverse(uart_num, UART_INV_RX | UART_INV_TX));
 #else
-   ESP_ERROR_CHECK(uart_set_line_inverse(uart_num, UART_INVERSE_RXD | UART_INVERSE_TXD));                 // V1.6.0
+  ESP_ERROR_CHECK(uart_set_line_inverse(uart_num, UART_INV_RX | UART_INV_TX));
 #endif
-   ESP_ERROR_CHECK(uart_set_pin(uart_num, tx, rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-   gpio_set_pull_mode((gpio_num_t)rx, GPIO_PULLDOWN_ONLY);
-   gpio_pulldown_en((gpio_num_t)rx);
-   ESP_ERROR_CHECK(uart_driver_install(uart_num, RX_BUF_SIZE, 0,0, NULL, 0));
-   ESP_ERROR_CHECK(uart_isr_free(uart_num));
-   ESP_ERROR_CHECK(uart_isr_register(uart_num,uart_intr_handle, NULL, ESP_INTR_FLAG_IRAM, 0/*handle_console*/));
-   ESP_ERROR_CHECK(uart_enable_rx_intr(uart_num));
 
-    // setup transmitter ISR
-    timer_init(TIMER_GROUP_0, TIMER_1, &timer_config);
-    timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0);
-    timer_set_alarm_value(TIMER_GROUP_0, TIMER_1, SLOT_TIME);
-    timer_enable_intr(TIMER_GROUP_0, TIMER_1);
-    timer_isr_register(TIMER_GROUP_0, TIMER_1, &ISR_transmit_frame, NULL, 0, 0/*&s_timer_handle*/);
-    timer_set_alarm(TIMER_GROUP_0,TIMER_1,TIMER_ALARM_EN);
-   
-    uart_flush(uart_num);
+  ESP_ERROR_CHECK(uart_set_pin(uart_num, tx, rx, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
 
-    uart_intr_config_t uart_intr;
-    uart_intr.intr_enable_mask = UART_RXFIFO_FULL_INT_ENA_M | UART_RXFIFO_TOUT_INT_ENA_M;
-    uart_intr.rxfifo_full_thresh = 26;
-    uart_intr.rx_timeout_thresh = 2;
-    uart_intr.txfifo_empty_intr_thresh = 10;
-    uart_intr_config(uart_num, &uart_intr);
+  // Pull-down on RX to keep line stable when idle
+  gpio_set_pull_mode((gpio_num_t)rx, GPIO_PULLDOWN_ONLY);
+  gpio_pulldown_en((gpio_num_t)rx);
 
-    initialize_slot_status();
+  // Install UART driver, with RX ring buffer and an event queue on IDF5+
+#if ESP_IDF_VERSION_MAJOR >= 5
+  ESP_ERROR_CHECK(uart_driver_install(uart_num, RX_BUF_SIZE, 0, 20, &s_uart_queue, 0));
+#else
+  ESP_ERROR_CHECK(uart_driver_install(uart_num, RX_BUF_SIZE, 0, 0, NULL, 0));
+#endif
 
-    enable_receiving();
-	
- 	
-	if(DemoMode){													//Nur wenn demo Mode
-		uart_write_bytes(uart_num, sbus_frame, SBUS_FRAME_SIZE);
-		sbus_frame[24] += 0x10;
-	}
-	else{
-		pinMatrixOutDetach(tx_pin,false,true);
-	}
+  // On IDF4: hook our low-level ISR. On IDF5: driver owns the ISR.
+#if ESP_IDF_VERSION_MAJOR < 5
+  ESP_ERROR_CHECK(uart_isr_free(uart_num));
+  ESP_ERROR_CHECK(uart_isr_register(uart_num, uart_intr_handle, NULL, ESP_INTR_FLAG_IRAM, NULL));
+  ESP_ERROR_CHECK(uart_enable_rx_intr(uart_num));
+#else
+  ESP_ERROR_CHECK(uart_enable_rx_intr(uart_num));
+#endif
+
+  // === Portable RX thresholds / timeout (replaces uart_intr_config + macros) ===
+  // trigger interrupt when ~full SBUS frame is in FIFO and set RX timeout (~2 chars)
+  uart_set_rx_full_threshold(uart_num, 25);  // SBUS frame is 25 bytes
+  uart_set_rx_timeout(uart_num, 2);
+
+  // Timer for telemetry TX sequence
+  timer_init(TIMER_GROUP_0, SBUS2_TIMER, &timer_config);
+  timer_set_counter_value(TIMER_GROUP_0, SBUS2_TIMER, 0);
+  timer_set_alarm_value(TIMER_GROUP_0,   SBUS2_TIMER, SLOT_TIME);
+  timer_enable_intr(TIMER_GROUP_0,       SBUS2_TIMER);
+
+#if ESP_IDF_VERSION_MAJOR >= 5
+  // IDF5+: use callback API
+  ESP_ERROR_CHECK(timer_isr_callback_add(TIMER_GROUP_0, SBUS2_TIMER, &timer_cb_wrapper, NULL, 0));
+#else
+  // IDF4.x: legacy ISR register
+  timer_isr_register(TIMER_GROUP_0, SBUS2_TIMER, &ISR_transmit_frame, NULL, 0, NULL);
+#endif
+
+  timer_set_alarm(TIMER_GROUP_0, SBUS2_TIMER, TIMER_ALARM_EN);
+
+  // Make sure RX ring is clean
+#if ESP_IDF_VERSION_MAJOR >= 5
+  uart_flush_input(uart_num);
+#else
+  uart_flush(uart_num);
+#endif
+uart_flush_input(uart_num);
+buffer_index = 0;
+  initialize_slot_status();
+  enable_receiving();
+
+#if ESP_IDF_VERSION_MAJOR >= 5
+  // Spawn a tiny task to process UART events and read bytes from the driver RX ring
+  if (s_uart_task == nullptr) {
+    xTaskCreatePinnedToCore(uart_event_task, "sbus2_uart_evt", 8192, NULL, 20, &s_uart_task, ARDUINO_RUNNING_CORE);
+  }
+#endif
+
+  if (DemoMode) {
+    uart_write_bytes(uart_num, sbus_frame, SBUS_FRAME_SIZE);
+    sbus_frame[24] += 0x10;
+  } else {
+    // detach TX from matrix unless we actually transmit
+    pinMatrixOutDetach(tx_pin, false, true);
+  }
 }
 
-void initialize_slot_status()
-{
-   for (uint8_t i = 0; i < NUMBER_OF_SLOT; i++)
-   {
-      transmit_data_per_slot_status[i] = EMPTY;
-   }
+// ------------------------ helpers ------------------------
+
+static void initialize_slot_status() {
+  for (uint8_t i = 0; i < NUMBER_OF_SLOT; i++) {
+    transmit_data_per_slot_status[i] = EMPTY;
+  }
 }
 
-void disable_receiving()
-{
+static void disable_receiving() {
   sequence_count = 0;
-  
-  timer_set_alarm(TIMER_GROUP_0,TIMER_1,TIMER_ALARM_DIS);
-  timer_pause(TIMER_GROUP_0,TIMER_1);
-   
-  timer_set_alarm_value(TIMER_GROUP_0,TIMER_1,WAIT_TIME);     // RX Interrupt with delay of 700µs -> 700µs + 1300µs = 2ms
-  timer_set_counter_value(TIMER_GROUP_0,TIMER_1,0);
-  timer_set_alarm(TIMER_GROUP_0,TIMER_1,TIMER_ALARM_EN);
-  timer_start(TIMER_GROUP_0,TIMER_1);
+
+  // Start 2ms timer to schedule slot #1 after a valid SBUS2 frame
+  timer_set_alarm(TIMER_GROUP_0, SBUS2_TIMER, TIMER_ALARM_DIS);
+  timer_pause(TIMER_GROUP_0,  SBUS2_TIMER);
+  timer_set_alarm_value(TIMER_GROUP_0, SBUS2_TIMER, WAIT_TIME);
+  timer_set_counter_value(TIMER_GROUP_0,   SBUS2_TIMER, 0);
+  timer_set_alarm(TIMER_GROUP_0, SBUS2_TIMER, TIMER_ALARM_EN);
+  timer_start(TIMER_GROUP_0, SBUS2_TIMER);
 }
 
-void enable_receiving()
+static void enable_receiving() {
+  // 15ms guard (approx, long enough to catch next frame timeout)
+  timer_set_counter_value(TIMER_GROUP_0,   SBUS2_TIMER, 0);
+  timer_set_alarm_value(TIMER_GROUP_0,     SBUS2_TIMER, 15000);
+  timer_set_alarm(TIMER_GROUP_0,           SBUS2_TIMER, TIMER_ALARM_EN);
+
+  // Reset buffer for new RX
+  buffer_index = 0;
+}
+
+static inline void IncreaseTimer(int8_t frameNumber) {
+  int8_t temp = (frameNumber - previousFrame) % NUMBER_OF_FRAMES;
+  if (temp <= 0) temp += NUMBER_OF_FRAMES;
+  if (temp > 1)  {
+  	uart_lost_frame=(uart_lost_frame+1); 
+  }
+  frameCounter += temp;
+  previousFrame = frameNumber;
+}
+
+// ------------------------ UART RX processing ------------------------
+
+#if ESP_IDF_VERSION_MAJOR >= 5
+// IDF5+: process UART driver events and read bytes from the RX ring.
+//
+// Each burst on the SBUS2 wire (one 25-byte servo frame, or one 3-byte
+// telemetry slot from any sensor) is followed by a gap longer than the RX
+// timeout, so the driver posts exactly one UART_DATA event per burst, with
+// event.size = burst length. We read exactly event.size bytes per event, so
+// burst boundaries are kept even if this task runs late and several bursts
+// are already waiting in the ring (high telemetry traffic, e.g. a GPS sensor
+// filling many slots). Each burst is classified on its own and then dropped:
+// nothing accumulates between bursts, so the parser cannot get stuck.
+// An idle timeout and overflow handling are kept as extra recovery paths.
+#define RX_IDLE_RESET_MS  20
+
+static void uart_event_task(void *pvParameters)
 {
-   // disable transmitter ISR
-   /*timer_set_alarm(TIMER_GROUP_0,TIMER_1,TIMER_ALARM_DIS);
-   timer_pause(TIMER_GROUP_0,TIMER_1);
-   timer_set_counter_value(TIMER_GROUP_0,TIMER_1,0);*/
-   
-   timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0);
-   timer_set_alarm_value(TIMER_GROUP_0, TIMER_1, 15000);
-   timer_set_alarm(TIMER_GROUP_0,TIMER_1,TIMER_ALARM_EN);
+  (void)pvParameters;
+  uart_event_t event;
 
-   // flush input buffer first, to avoid getting old SBUS-Frames
-   //uart_flush(uart_num);
-   buffer_index = 0;
+  for (;;) {
+    if (xQueueReceive(s_uart_queue, &event, pdMS_TO_TICKS(RX_IDLE_RESET_MS)) != pdTRUE) {
+      buffer_index = 0;          // line idle: nothing pending
+      continue;
+    }
+
+    if (event.type == UART_FIFO_OVF || event.type == UART_BUFFER_FULL) {
+      // Ring and event queue are out of step: clear both and start fresh.
+      uart_flush_input(uart_num);
+      xQueueReset(s_uart_queue);
+      buffer_index = 0;
+      log_d("[SBUS2] RX overflow, flushed");
+      continue;
+    }
+
+    if (event.type != UART_DATA) {
+      continue;                  // parity/frame errors etc.: data still arrives as UART_DATA
+    }
+
+    // Read exactly this burst. Bytes beyond the buffer are drained but not stored.
+    size_t len = 0;
+    for (size_t remaining = event.size; remaining > 0; remaining--) {
+      uint8_t b;
+      if (uart_read_bytes(uart_num, &b, 1, 0) != 1) break;
+      if (len < UART_RXBUFSIZE) rxbuf[len] = b;
+      len++;
+    }
+    buffer_index = 0;            // not used for parsing on IDF5; kept for compatibility
+
+    if ((len == SBUS_FRAME_SIZE) && (rxbuf[0] == 0x0F)) {
+      telemetry_ready = false;
+      sbus_ready      = false;
+      frame_ready     = true;
+
+      for (uint8_t i = 0; i < SBUS_FRAME_SIZE; i++) {
+        sbusData[i] = rxbuf[i];
+      }
+
+      disable_receiving();
+      IncreaseTimer((rxbuf[24] & 0x30) >> 4);
+
+      if ((rxbuf[24] & 0x0F) == 0x04) {
+        telemetry_ready = true;
+        sbus_ready      = true;
+        SBUS2_get_all_servo_data();
+        start_transmit_sequencer(((rxbuf[24] & 0x30) >> 4));
+      } else if ((rxbuf[24] & 0x0F) == 0x00) {
+        telemetry_ready = false;
+        sbus_ready      = true;
+        SBUS2_get_all_servo_data();
+      } else {
+        log_d("[SBUS2] Invalid Frame End Byte");
+      }
+    }
+    else if ((len == SLOT_DATA_LENGTH) && (((rxbuf[0] & 0x0F) == 0x03) || ((rxbuf[0] & 0x0F) == 0x0B))) {
+      uint8_t temp = rxbuf[0];
+      telemetryData[temp]     = rxbuf[0];
+      telemetryData[temp + 1] = rxbuf[1];
+      telemetryData[temp + 2] = rxbuf[2];
+    }
+    else {
+      // Unknown length or content (partial frame at power-up, two slots merged
+      // because a sensor transmitted late, corrupted byte...). Drop this burst
+      // only; the next one is parsed normally. Worst case: one frame lost.
+      log_d("[SBUS2] Discarded burst of %u bytes", (unsigned)len);
+    }
+  }
 }
-
-inline void IncreaseTimer( int8_t frameNumber)
-{
-   int8_t temp = (frameNumber - previousFrame) % NUMBER_OF_FRAMES;
-   if (temp <= 0 )
-      temp += NUMBER_OF_FRAMES; 
-   if (temp > 1)
-      uart_lost_frame++;
-   frameCounter += temp;
-   previousFrame = frameNumber;   
-}
-
+#else
+// IDF4.x: custom low-level ISR that reads UART1 FIFO directly
 static void IRAM_ATTR uart_intr_handle(void *arg)
 {
-  //digitalWrite(18,HIGH);
-  pinMatrixOutDetach(tx_pin,false,true);
-  uart_clear_intr_status(uart_num, UART_RXFIFO_FULL_INT_CLR|UART_RXFIFO_TOUT_INT_CLR);
-  uint16_t rx_fifo_len, status;
-  status = UART1.int_st.val; // read UART interrupt Status
-  rx_fifo_len = UART1.status.rxfifo_cnt; // read number of bytes in UART buffer
-  /*Serial.print("Fifo len = ");
-  Serial.println(rx_fifo_len);*/
-  if(rx_fifo_len == 0){
-	  return;
-  }
-  else if(rx_fifo_len == 25){
-	  
-  }
-  else if(rx_fifo_len == 3){
-	  
-  }
-  else{
-	  //digitalWrite(18,HIGH);
-	  /*Serial.print("Error! -> rx_fifo_len = ");
-	  Serial.print(rx_fifo_len);
-	  Serial.print(" Value = ");
-	  for(uint8_t i=0; i<=rx_fifo_len;i++){
-	 	Serial.print(rxbuf[i], HEX);
-		Serial.print(", ");
-	  }
-	  Serial.println(" [HEX]");*/
-	  uart_flush(uart_num);
-	  uart_clear_intr_status(uart_num, UART_RXFIFO_FULL_INT_CLR|UART_RXFIFO_TOUT_INT_CLR);
-	  log_i("[SBUS2] Wrong Frame length\l\n");
-	  return;
-  }
-  //digitalWrite(18,HIGH);
+  (void)arg;
 
-  while(rx_fifo_len){
-    rxbuf[buffer_index] = UART1.fifo.rw_byte; // read all bytes
+  // Detach TX while receiving
+  pinMatrixOutDetach(tx_pin, false, true);
+
+  // clear reasons
+  uart_clear_intr_status(uart_num, UART_RXFIFO_FULL_INT_CLR | UART_RXFIFO_TOUT_INT_CLR);
+
+  uint16_t rx_fifo_len = UART1.status.rxfifo_cnt; // bytes available
+
+  if (rx_fifo_len == 0) {
+    return;
+  } else if (rx_fifo_len == SBUS_FRAME_SIZE || rx_fifo_len == SLOT_DATA_LENGTH) {
+    // ok
+  } else {
+    // length mismatch -> flush
+    uart_flush(uart_num);
+    uart_clear_intr_status(uart_num, UART_RXFIFO_FULL_INT_CLR | UART_RXFIFO_TOUT_INT_CLR);
+    log_i("[SBUS2] Wrong Frame length");
+    return;
+  }
+
+  while (rx_fifo_len) {
+    rxbuf[buffer_index] = UART1.fifo.rw_byte; // read byte
     rx_fifo_len--;
-	buffer_index++;
-	//Serial.print(rxbuf[buffer_index],HEX);
-	//Serial.print(" ");
-    /*if(rxbuf[0] == 0x0f){						// Start of SBUS(2) Frame
-      buffer_index++;
-    }
-    else{										// Telemetry Slot?
-		//digitalWrite(16,HIGH);
-		buffer_index++;
-    }*/
+    buffer_index++;
   }
-    if ((buffer_index == SBUS_FRAME_SIZE) && (rxbuf[0]== 0x0f))		// SBUS Frame
-     {
-		//digitalWrite(18,HIGH);
-        telemetry_ready = false;
-        sbus_ready = false;
-        frame_ready = true;
-        for(uint8_t i = 0; i < UART_RXBUFSIZE; i++){
-          sbusData[i] = rxbuf[i];
-        }
-        disable_receiving();
-        IncreaseTimer((rxbuf[24]&0x30) >> 4);
-        buffer_index = 0;
-		//Serial.println();
-        if((rxbuf[24]&0x0f) == 0x04 ){    					// Valid SBUS2 Frame
-		  //digitalWrite(18,HIGH);
-          telemetry_ready = true;
-          sbus_ready = true;
-          SBUS2_get_all_servo_data();
-          start_transmit_sequencer(((rxbuf[24]&0x30) >> 4)); // frame number needed to select correct telemetry slot
-        }
-        else if((rxbuf[24]&0x0f) == 0x00 ){					 // Just SBUS Frame (without Telemetry)
-          telemetry_ready = false;
-          sbus_ready = true;
-          SBUS2_get_all_servo_data();
-        }
-        else{                             					// Something else -> Error
-          telemetry_ready = false;
-          sbus_ready = false;
-		  uart_flush(uart_num);
-		  uart_clear_intr_status(uart_num, UART_RXFIFO_FULL_INT_CLR|UART_RXFIFO_TOUT_INT_CLR);
-		  log_i("[SBUS2]Invalid Frame End Byte");
-        }
-		//pinMatrixOutDetach(tx_pin,false,true);
-     }
-	 else if(buffer_index == SBUS_FRAME_SIZE){
-		 uart_flush(uart_num);
-		 uart_clear_intr_status(uart_num, UART_RXFIFO_FULL_INT_CLR|UART_RXFIFO_TOUT_INT_CLR);
-		 log_i("[SBUS2] Invalid Frame Start Byte");
-	 }
-	 else if((buffer_index == SLOT_DATA_LENGTH) && ((((rxbuf[0]&0x0f) == 0x03 )||(rxbuf[0]&0x0f) == 0x0B )))	// Telemetry Slot
-     {
-		//digitalWrite(18,HIGH);
-		uint8_t temp = rxbuf[0];
-		telemetryData[temp] = rxbuf[0];
-		telemetryData[temp+1] = rxbuf[1];
-		telemetryData[temp+2] = rxbuf[2];
-		buffer_index = 0;
-		//pinMatrixOutDetach(tx_pin,false,true);
-		//digitalWrite(18,LOW);
-	 }
-	 else if(buffer_index == SLOT_DATA_LENGTH){																// Something went wrong
-		 uart_flush(uart_num);
-		 uart_clear_intr_status(uart_num, UART_RXFIFO_FULL_INT_CLR|UART_RXFIFO_TOUT_INT_CLR);
-		 log_i("[SBUS2] Invalid Slot ID");
-	 }
-  //}
-  //digitalWrite(18,LOW);
-  // after reading bytes from buffer clear UART interrupt status
-  //uart_flush(uart_num);
-  uart_clear_intr_status(uart_num, UART_RXFIFO_FULL_INT_CLR|UART_RXFIFO_TOUT_INT_CLR);
 
+  if ((buffer_index == SBUS_FRAME_SIZE) && (rxbuf[0] == 0x0F)) {
+    telemetry_ready = false;
+    sbus_ready      = false;
+    frame_ready     = true;
+
+    for (uint8_t i = 0; i < UART_RXBUFSIZE; i++) sbusData[i] = rxbuf[i];
+
+    disable_receiving();
+    IncreaseTimer((rxbuf[24] & 0x30) >> 4);
+    buffer_index = 0;
+
+    if ((rxbuf[24] & 0x0F) == 0x04) {
+      telemetry_ready = true;
+      sbus_ready      = true;
+      SBUS2_get_all_servo_data();
+      start_transmit_sequencer(((rxbuf[24] & 0x30) >> 4));
+    } else if ((rxbuf[24] & 0x0F) == 0x00) {
+      telemetry_ready = false;
+      sbus_ready      = true;
+      SBUS2_get_all_servo_data();
+    } else {
+      uart_flush(uart_num);
+      uart_clear_intr_status(uart_num, UART_RXFIFO_FULL_INT_CLR | UART_RXFIFO_TOUT_INT_CLR);
+      log_i("[SBUS2] Invalid Frame End Byte");
+    }
+  }
+  else if (buffer_index == SBUS_FRAME_SIZE) {
+    uart_flush(uart_num);
+    uart_clear_intr_status(uart_num, UART_RXFIFO_FULL_INT_CLR | UART_RXFIFO_TOUT_INT_CLR);
+    log_i("[SBUS2] Invalid Frame Start Byte");
+  }
+  else if ((buffer_index == SLOT_DATA_LENGTH) && ((((rxbuf[0] & 0x0F) == 0x03) || ((rxbuf[0] & 0x0F) == 0x0B)))) {
+    uint8_t temp  = rxbuf[0];
+    telemetryData[temp]     = rxbuf[0];
+    telemetryData[temp + 1] = rxbuf[1];
+    telemetryData[temp + 2] = rxbuf[2];
+    buffer_index = 0;
+  }
+  else if (buffer_index == SLOT_DATA_LENGTH) {
+    uart_flush(uart_num);
+    uart_clear_intr_status(uart_num, UART_RXFIFO_FULL_INT_CLR | UART_RXFIFO_TOUT_INT_CLR);
+    log_i("[SBUS2] Invalid Slot ID");
+  }
+
+  // clear UART interrupt status again
+  uart_clear_intr_status(uart_num, UART_RXFIFO_FULL_INT_CLR | UART_RXFIFO_TOUT_INT_CLR);
 }
+#endif
 
-/****************************************************************
- * transmit_frame
- * 
- * Implemented as an ISR to fit the strict timing requirements
- * Slot 1 has to be transmitted 2ms after receiving the SBUS2 Frame
- * Slot 2-8 has to be transmitted every 660 mirco seconds
- * Each Slot needs about 320 mircoseconds to be transmitted via uart
- * The delay between the Slots must not exceed 400 mirco seconds
- * 
- ****************************************************************/
+// ------------------------ Timer ISR: transmit telemetry slots ------------------------
 
-static void IRAM_ATTR ISR_transmit_frame(void *arg)
+static void ISR_transmit_frame(void *arg)
 {
+  (void)arg;
+
+#if ESP_IDF_VERSION_MAJOR >= 5
+  timer_group_clr_intr_status_in_isr(TIMER_GROUP_0, SBUS2_TIMER);
+  timer_group_enable_alarm_in_isr(TIMER_GROUP_0, SBUS2_TIMER);
+#else
   TIMERG0.int_clr_timers.t1 = 1;
   TIMERG0.hw_timer[1].config.alarm_en = 1;
-  //digitalWrite(18,HIGH);
-  pinMatrixOutDetach(tx_pin,false,true);
-  if (sequence_count < 8) // transmit slots
-  {
+#endif
+
+  // detach TX while preparing
+  pinMatrixOutDetach(tx_pin, false, true);
+
+  if (sequence_count < 8) {
     uint8_t actual_slot = (sequence_count) + (gl_current_frame * NUMBER_OF_SLOT_IN_FRAME);
+
     // if data available in slot then send it
-    if (transmit_data_per_slot_status[actual_slot] == AVAILABLE){
-		//digitalWrite(18,HIGH);
-		pinMatrixOutAttach(tx_pin, U1TXD_OUT_IDX, false, false);
+    if (transmit_data_per_slot_status[actual_slot] == AVAILABLE) {
+      pinMatrixOutAttach(tx_pin, U1TXD_OUT_IDX, false, false);
+
       char buffer[SLOT_DATA_LENGTH];
       memcpy(buffer, (const void *)transmit_data_per_slot_data[actual_slot], SLOT_DATA_LENGTH);
+
       transmit_data_per_slot_status[actual_slot] = TRANSMITTING;
-      // send the whole slot
       uart_write_bytes(uart_num, buffer, SLOT_DATA_LENGTH);
       transmit_data_per_slot_status[actual_slot] = EMPTY;
-	  //digitalWrite(18,LOW);
     }
-	if(sequence_count ==7){
-		timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0);
-		timer_set_alarm_value(TIMER_GROUP_0, TIMER_1, 5150);
-		//timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0);
-		timer_set_alarm(TIMER_GROUP_0,TIMER_1,TIMER_ALARM_EN);
-	}
-	else{
-		timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0);
-		timer_set_alarm_value(TIMER_GROUP_0, TIMER_1, SLOT_TIME);
-		//timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0);
-		timer_set_alarm(TIMER_GROUP_0,TIMER_1,TIMER_ALARM_EN);
-	}
-	
-  }
-  /*else if(sequence_count = 8){
-	timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0);
-    timer_set_alarm_value(TIMER_GROUP_0, TIMER_1, 4500);
-	//timer_set_counter_value(TIMER_GROUP_0, TIMER_1, 0);
-    timer_set_alarm(TIMER_GROUP_0,TIMER_1,TIMER_ALARM_EN);
-  }*/
-	  
-  else{
-	//digitalWrite(18,HIGH);	// dummy for sending SBUS2 Frame
-	if(DemoMode){
-		pinMatrixOutAttach(tx_pin, U1TXD_OUT_IDX, false, false);
-		uart_write_bytes(uart_num, sbus_frame, SBUS_FRAME_SIZE);
-		sbus_frame[24] += 0x10;
-		if(sbus_frame[24] > 0x34){
-			sbus_frame[24] = 0x04;
-		}
-	}
-	else{
-		//pinMatrixOutDetach(tx_pin,false,true);
-	}
-		
-    buffer_index = 0;
-    transmit = false;
-    //telemetry_ready = false;
-    sequence_count = 0;
 
+    // last slot has slightly longer pause
+    timer_set_counter_value(TIMER_GROUP_0, SBUS2_TIMER, 0);
+    if (sequence_count == 7) {
+      timer_set_alarm_value(TIMER_GROUP_0, SBUS2_TIMER, 5150);
+    } else {
+      timer_set_alarm_value(TIMER_GROUP_0, SBUS2_TIMER, SLOT_TIME);
+    }
+    timer_set_alarm(TIMER_GROUP_0, SBUS2_TIMER, TIMER_ALARM_EN);
+  } else {
+    if (DemoMode) {
+      pinMatrixOutAttach(tx_pin, U1TXD_OUT_IDX, false, false);
+      uart_write_bytes(uart_num, sbus_frame, SBUS_FRAME_SIZE);
+      sbus_frame[24] += 0x10;
+      if (sbus_frame[24] > 0x34) sbus_frame[24] = 0x04;
+    }
+
+    buffer_index   = 0;
+    transmit       = false;
+    sequence_count = 0;
     enable_receiving();
   }
-  //digitalWrite(18,LOW);
-  sequence_count++;
-   
+
+  sequence_count=(sequence_count+1);
 }
 
-void start_transmit_sequencer(uint8_t frame_number)
+static void start_transmit_sequencer(uint8_t frame_number)
 {
-   gl_current_frame = frame_number;
-   // we dont need more frames to be received, lets handle this one first
-   disable_receiving();
+  gl_current_frame = frame_number;
+  // we don’t need more frames to be received while transmitting this one
+  disable_receiving();
 }
 
+// ------------------------ public TX/RX helpers ------------------------
 
 void SBUS2_transmit_telemetry_data(uint8_t slot, uint8_t data[SLOT_DATA_LENGTH])
 {
-   if (transmit_data_per_slot_status[slot] != TRANSMITTING)
-   {
-
-      transmit_data_per_slot_data[slot][0] = Slot_ID[slot];
-      transmit_data_per_slot_data[slot][1] = data[1];
-      transmit_data_per_slot_data[slot][2] = data[2];
-
-      transmit_data_per_slot_status[slot] = AVAILABLE;
-   }
+  if (transmit_data_per_slot_status[slot] != TRANSMITTING) {
+    transmit_data_per_slot_data[slot][0] = Slot_ID[slot];
+    transmit_data_per_slot_data[slot][1] = data[1];
+    transmit_data_per_slot_data[slot][2] = data[2];
+    transmit_data_per_slot_status[slot]  = AVAILABLE;
+  }
 }
 
-void SBUS2_get_all_servo_data()
+static void SBUS2_get_all_servo_data()
 {
-   channels[0] = ((sbusData[1] | sbusData[2] << 8) & 0x07FF);
-   channels[1] = ((sbusData[2] >> 3 | sbusData[3] << 5) & 0x07FF);
-   channels[2] = ((sbusData[3] >> 6 | sbusData[4] << 2 | sbusData[5] << 10) & 0x07FF);
-   channels[3] = ((sbusData[5] >> 1 | sbusData[6] << 7) & 0x07FF);
-   channels[4] = ((sbusData[6] >> 4 | sbusData[7] << 4) & 0x07FF);
-   channels[5] = ((sbusData[7] >> 7 | sbusData[8] << 1 | sbusData[9] << 9) & 0x07FF);
-   channels[6] = ((sbusData[9] >> 2 | sbusData[10] << 6) & 0x07FF);
-   channels[7] = ((sbusData[10] >> 5 | sbusData[11] << 3) & 0x07FF);
-   channels[8] = ((sbusData[12] | sbusData[13] << 8) & 0x07FF);
-   channels[9] = ((sbusData[13] >> 3 | sbusData[14] << 5) & 0x07FF);
-   channels[10] = ((sbusData[14] >> 6 | sbusData[15] << 2 | sbusData[16] << 10) & 0x07FF);
-   channels[11] = ((sbusData[16] >> 1 | sbusData[17] << 7) & 0x07FF);
-   channels[12] = ((sbusData[17] >> 4 | sbusData[18] << 4) & 0x07FF);
-   channels[13] = ((sbusData[18] >> 7 | sbusData[19] << 1 | sbusData[20] << 9) & 0x07FF);
-   channels[14] = ((sbusData[20] >> 2 | sbusData[21] << 6) & 0x07FF);
-   channels[15] = ((sbusData[21] >> 5 | sbusData[22] << 3) & 0x07FF);
+  channels[0]  = ((sbusData[1] | sbusData[2] << 8) & 0x07FF);
+  channels[1]  = ((sbusData[2] >> 3 | sbusData[3] << 5) & 0x07FF);
+  channels[2]  = ((sbusData[3] >> 6 | sbusData[4] << 2 | sbusData[5] << 10) & 0x07FF);
+  channels[3]  = ((sbusData[5] >> 1 | sbusData[6] << 7) & 0x07FF);
+  channels[4]  = ((sbusData[6] >> 4 | sbusData[7] << 4) & 0x07FF);
+  channels[5]  = ((sbusData[7] >> 7 | sbusData[8] << 1 | sbusData[9] << 9) & 0x07FF);
+  channels[6]  = ((sbusData[9] >> 2 | sbusData[10] << 6) & 0x07FF);
+  channels[7]  = ((sbusData[10] >> 5 | sbusData[11] << 3) & 0x07FF);
+  channels[8]  = ((sbusData[12] | sbusData[13] << 8) & 0x07FF);
+  channels[9]  = ((sbusData[13] >> 3 | sbusData[14] << 5) & 0x07FF);
+  channels[10] = ((sbusData[14] >> 6 | sbusData[15] << 2 | sbusData[16] << 10) & 0x07FF);
+  channels[11] = ((sbusData[16] >> 1 | sbusData[17] << 7) & 0x07FF);
+  channels[12] = ((sbusData[17] >> 4 | sbusData[18] << 4) & 0x07FF);
+  channels[13] = ((sbusData[18] >> 7 | sbusData[19] << 1 | sbusData[20] << 9) & 0x07FF);
+  channels[14] = ((sbusData[20] >> 2 | sbusData[21] << 6) & 0x07FF);
+  channels[15] = ((sbusData[21] >> 5 | sbusData[22] << 3) & 0x07FF);
 
-   // DigiChannel 1
-   if (sbusData[23] & (1 << 0))
-   {
-      channels[16] = 1;
-   }
-   else
-   {
-      channels[16] = 0;
-   }
-   // DigiChannel 2
-   if (sbusData[23] & (1 << 1))
-   {
-      channels[17] = 1;
-   }
-   else
-   {
-      channels[17] = 0;
-   }
-   if (sbusData[23] & 0x04){
-     FER_buf[FER_count] = 1;
-     FER_count ++;
-     if(FER_count > 99){
-       FER_count = 0;
-     }
-   }
-  else{
-     FER_buf[FER_count] = 0;
-     FER_count ++;
-     if(FER_count > 99){
-       FER_count = 0;
-     }
-   }
+  channels[16] = (sbusData[23] & (1 << 0)) ? 1 : 0; // Digichannel 1
+  channels[17] = (sbusData[23] & (1 << 1)) ? 1 : 0; // Digichannel 2
+
+  if (sbusData[23] & 0x04) {
+    FER_buf[FER_count] = 1;
+  } else {
+    FER_buf[FER_count] = 0;
+  }
+  FER_count=(FER_count+1);
+  if (FER_count > 99) FER_count = 0;
 }
 
-
-void SBUS2_get_status( uint16_t *uart_dropped_frame, bool *transmision_dropt_frame, bool *failsave )
+void SBUS2_get_status(uint16_t *uart_dropped_frame, bool *transmission_dropt_frame, bool *failsafe)
 {
-   if (frameCounter < 60)
-   {
-      uart_lost_frame = 0;
-   }
-   *uart_dropped_frame = uart_lost_frame;
-   uart_lost_frame = 0;
-   *transmision_dropt_frame = sbusData[23] & 0x04 ? true : false;
-   *failsave = sbusData[23] & 0x08 ? true : false;
+  if (frameCounter < 60) { uart_lost_frame = 0; }
+
+  *uart_dropped_frame       = uart_lost_frame;
+  uart_lost_frame           = 0;
+  *transmission_dropt_frame = (sbusData[23] & 0x04) ? true : false;
+  *failsafe                 = (sbusData[23] & 0x08) ? true : false;
 }
 
 int16_t SBUS2_get_servo_data(uint8_t channel)
 {
-   if (channel < NUMBER_OF_CHANNELS)
-   {
-      return channels[channel];
-   }
-   else
-   {
-      return -1;
-   }
+  if (channel < NUMBER_OF_CHANNELS) return channels[channel];
+  return -1;
 }
 
 bool SBUS_Ready()
 {
-   if (sbus_ready) // Checking sbus_ready Flag
-   {
-    sbus_ready = false;
-    return true;
-   }
-   else
-   {
-      return false;
-   }
+  if (sbus_ready) { sbus_ready = false; return true; }
+  return false;
 }
 
 bool SBUS2_Ready()
 {
-	//Serial.println("test");
-   if (telemetry_ready)
-   {
-    telemetry_ready = false;
-	//digitalWrite(18,LOW);
-    return true;
-   }
-   else
-   {
-      return false;
-   }
+  if (telemetry_ready) { telemetry_ready = false; return true; }
+  return false;
 }
 
 bool SBUS_Ready(bool reset)
 {
-  if (sbus_ready)   // Checking sbus_ready Flag
-   {
-	if(reset){
-		sbus_ready = false;
-    }
-    return true;
-   }
-   else{
-    return false;
-   }
+  if (sbus_ready) { if (reset) sbus_ready = false; return true; }
+  return false;
 }
 
 bool SBUS2_Ready(bool reset)
 {
-  if (telemetry_ready)
-   {
-    if(reset){
-		telemetry_ready = false;
-    }
-    return true;
-   }
-   else{
-    return false;
-   }
+  if (telemetry_ready) { if (reset) telemetry_ready = false; return true; }
+  return false;
 }
 
-uint8_t SBUS_get_FER(){
+uint8_t SBUS_get_FER()
+{
   uint8_t fer = 0;
-  for(uint8_t i = 0; i<100; i++){
-    if(FER_buf[i] == 1){
-      fer++;
-    }
-  }
+  for (uint8_t i = 0; i < 100; i++) if (FER_buf[i] == 1) fer++;
   return fer;
 }
 
-uint8_t SBUS_get_RSSI(){
+uint8_t SBUS_get_RSSI()
+{
   uint8_t rssi = SBUS_get_FER();
   rssi = 100 - rssi;
   return rssi;
 }
 
-void SBUS2_print_Raw(){
-	for(uint16_t i = 0; i<256;i++){
-		Serial.print(i,HEX);
-		Serial.print(" ");
-	}
-	Serial.println();
-	for(uint16_t i = 0; i<256;i++){
-		Serial.print(telemetryData[i],HEX);
-		Serial.print(" ");
-	}
-	Serial.println();
+void SBUS2_print_Raw()
+{
+  for (uint16_t i = 0; i < 256; i++) { Serial.print(i, HEX); Serial.print(" "); }
+  Serial.println();
+  for (uint16_t i = 0; i < 256; i++) { Serial.print(telemetryData[i], HEX); Serial.print(" "); }
+  Serial.println();
 }
 
-bool SBUS2_get_Slot(uint8_t slot, uint8_t *lowbyte, uint8_t *highbyte){
-	uint8_t slotid = Slot_ID[slot];
-	if(telemetryData[slotid] == slotid){
-		// Sensordaten vorhanden
-		*lowbyte = telemetryData[slotid+1];
-		*highbyte = telemetryData[slotid+2];
-		telemetryData[slotid] = 0;
-		telemetryData[slotid+1] = 0;
-		telemetryData[slotid+2] = 0;
-		return true;
-	}
-	else{
-		// Keine Sensordaten vorhanden
-		*lowbyte = 0;
-		*highbyte = 0;
-		return false;
-	}
+bool SBUS2_get_Slot(uint8_t slot, uint8_t *lowbyte, uint8_t *highbyte)
+{
+  uint8_t slotid = Slot_ID[slot];
+  if (telemetryData[slotid] == slotid) {
+    *lowbyte  = telemetryData[slotid + 1];
+    *highbyte = telemetryData[slotid + 2];
+    telemetryData[slotid]     = 0;
+    telemetryData[slotid + 1] = 0;
+    telemetryData[slotid + 2] = 0;
+    return true;
+  } else {
+    *lowbyte  = 0;
+    *highbyte = 0;
+    return false;
+  }
 }
 
-void SBUS_disable(){
-  uart_disable_rx_intr(UART_NUM_2);
-  timer_set_alarm(TIMER_GROUP_0,TIMER_1,TIMER_ALARM_DIS);
+void SBUS_disable()
+{
+  uart_disable_rx_intr(uart_num);
+  timer_set_alarm(TIMER_GROUP_0, SBUS2_TIMER, TIMER_ALARM_DIS);
 }
 
-void SBUS_enable(){
-  uart_enable_rx_intr(UART_NUM_2);
+void SBUS_enable()
+{
+  uart_enable_rx_intr(uart_num);
   initialize_slot_status();
   enable_receiving();
 }
 
-void SBUS2_disable(){
-  SBUS_disable();
-}
+void SBUS2_disable() { SBUS_disable(); }
+void SBUS2_enable()  { SBUS_enable();  }
 
-void SBUS2_enable(){
-  SBUS_enable();
-}
 #endif // ESP32
